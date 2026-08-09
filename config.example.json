@@ -1,0 +1,9 @@
+{
+  "target_processes": ["claude", "codex"],
+  "resume_text": "continue",
+  "poll_interval": 30,
+  "max_attempts": 2,
+  "checkpoint_enabled": true,
+  "prevent_sleep": "always",
+  "dry_run": false
+}
