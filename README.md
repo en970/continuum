@@ -30,7 +30,7 @@ preferred when present: no permissions needed, and nothing to break.
 ## Install
 
 ```sh
-git clone https://github.com/YOURNAME/continuum.git
+git clone https://github.com/en970/continuum.git
 cd continuum
 ./install.sh
 ```
