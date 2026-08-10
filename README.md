@@ -11,6 +11,10 @@ at the moment the limit resets.
 limit you already have to reset, then sends a single message you would have
 sent yourself. Nothing is sent while a limit is in effect.
 
+<p align="center">
+  <img src="docs/screenshot.png" width="300" alt="The Continuum window: a checkbox list of open sessions, one of them at its limit and due to resume at 15:40">
+</p>
+
 ---
 
 ## What it does
