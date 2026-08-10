@@ -41,6 +41,38 @@ uninstall() {
     rm -f "$BIN_DIR/continuum"
     [ -L "$HOME/.claude/skills/continuum" ] && rm -f "$HOME/.claude/skills/continuum" || true
     rm -rf "/Applications/Continuum.app"
+    "$PY" - <<'EOF' || true
+import json, os
+path = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(path, encoding="utf-8") as fh:
+        settings = json.load(fh)
+except (OSError, ValueError):
+    raise SystemExit(0)
+
+hooks = settings.get("hooks", {})
+removed = False
+for event in list(hooks):
+    groups = []
+    for group in hooks[event]:
+        kept = [h for h in group.get("hooks", [])
+                if "continuum hook " not in str(h.get("command", ""))]
+        if len(kept) != len(group.get("hooks", [])):
+            removed = True
+        if kept:
+            group["hooks"] = kept
+            groups.append(group)
+    if groups:
+        hooks[event] = groups
+    else:
+        del hooks[event]
+
+if removed:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    print("  removed Claude Code hooks")
+EOF
     RC=$(rc_file)
     if [ -n "$RC" ] && [ -f "$RC" ] && grep -qF "$HOOK_MARK" "$RC"; then
         # Drop the marker line and the two lines of hook that follow it
@@ -111,6 +143,57 @@ if [ -n "$RC" ]; then
         } >> "$RC"
         echo "installed: shell hook in $RC"
     fi
+fi
+
+# --- claude code hooks ----------------------------------------------------
+# Hooks are the authoritative signal: StopFailure says a rate limit happened,
+# SessionStart puts the project's STATE.md back into a fresh context. Screen
+# scraping stays as a fallback for setups without hooks.
+if [ -f "$HOME/.claude/settings.json" ] || [ -d "$HOME/.claude" ]; then
+    "$PY" - "$BIN_DIR/continuum" <<'EOF'
+import json, os, shutil, sys
+
+cli = sys.argv[1]
+path = os.path.expanduser("~/.claude/settings.json")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        settings = json.load(fh)
+except (OSError, ValueError):
+    settings = {}
+
+wanted = [
+    ("SessionStart", "startup|resume|clear|compact", "session-start"),
+    ("StopFailure",  "rate_limit",                   "stop-failure"),
+    ("PreCompact",   None,                           "pre-compact"),
+]
+
+hooks = settings.setdefault("hooks", {})
+added = []
+for event, matcher, verb in wanted:
+    command = f"{cli} hook {verb}"
+    groups = hooks.setdefault(event, [])
+    # Leave any existing hooks for this event alone; only skip if ours is there
+    if any(command == h.get("command")
+           for g in groups for h in g.get("hooks", [])):
+        continue
+    group = {"hooks": [{"type": "command", "command": command}]}
+    if matcher:
+        group["matcher"] = matcher
+    groups.append(group)
+    added.append(event)
+
+if added:
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".continuum-backup")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    print("installed: Claude Code hooks (" + ", ".join(added) + ")")
+else:
+    print("already present: Claude Code hooks")
+EOF
 fi
 
 # --- app ------------------------------------------------------------------

@@ -49,6 +49,8 @@ LOG_PATH = STATE_DIR / "continuum.log"
 PID_PATH = STATE_DIR / "continuum.pid"
 # The GUI reads this to find the CLI regardless of where the repo was cloned.
 INSTALL_PATH = STATE_DIR / "install.json"
+# Claude Code hooks drop files here; the watcher consumes them each scan.
+EVENT_DIR = STATE_DIR / "events"
 
 log = logging.getLogger("continuum")
 
@@ -532,6 +534,146 @@ def write_install_marker():
     }, indent=2), encoding="utf-8")
 
 
+# --- Hook events ----------------------------------------------------------
+#
+# Screen scraping is a guess: it broke the day Claude Code said "session limit"
+# where the patterns expected "usage limit reached". Hooks are the vendor
+# telling us directly, so they are the primary signal and scraping is backup.
+
+def record_event(kind, payload):
+    """Called from a hook process. Must be quick — Claude is waiting on it."""
+    EVENT_DIR.mkdir(parents=True, exist_ok=True)
+    record = {
+        "kind": kind,
+        "at": time.time(),
+        "cwd": payload.get("cwd") or "",
+        "session_id": payload.get("session_id") or "",
+        "transcript": payload.get("transcript_path") or "",
+    }
+    path = EVENT_DIR / f"{time.time_ns()}-{os.getpid()}.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def consume_events():
+    """Read and delete every pending hook event. Returns cwd -> {kind: record}."""
+    if not EVENT_DIR.exists():
+        return {}
+    by_cwd = {}
+    for path in sorted(EVENT_DIR.glob("*.json")):
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            rec = None
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if not rec or not rec.get("cwd"):
+            continue
+        # Events older than an hour describe a situation that has moved on
+        if time.time() - rec.get("at", 0) > 3600:
+            continue
+        by_cwd.setdefault(rec["cwd"], {})[rec["kind"]] = rec
+    return by_cwd
+
+
+def limit_from_transcript(path, max_lines=400, max_age=7200):
+    """
+    Find the most recent rate-limit record in a session transcript.
+
+    The hook says a rate limit happened but not when it lifts. Transcript
+    records are structured — a rate-limited turn carries error="rate_limit",
+    isApiErrorMessage=true and apiErrorStatus=429, with the banner text in
+    message.content[].text. Reading those fields beats matching patterns
+    against the screen: no wording to break, and the transcript does not
+    scroll away. Only the reset time inside the text still has to be parsed.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            tail = fh.readlines()[-max_lines:]
+    except OSError:
+        return None
+
+    for raw in reversed(tail):
+        if "rate_limit" not in raw and "isApiErrorMessage" not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if rec.get("error") != "rate_limit" and not rec.get("isApiErrorMessage"):
+            continue
+        # Ignore a limit from an earlier day still sitting in the file
+        stamp = rec.get("timestamp") or ""
+        if stamp:
+            try:
+                when = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
+                if (datetime.utcnow() - when).total_seconds() > max_age:
+                    continue
+            except ValueError:
+                pass
+        for block in (rec.get("message") or {}).get("content") or []:
+            text = (block or {}).get("text") or ""
+            if text.strip():
+                return text.strip()
+    return None
+
+
+def state_digest(cwd, limit=3000):
+    """The project's STATE.md, trimmed, ready to hand to a fresh context."""
+    path = Path(cwd) / ".continuum" / "STATE.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    if len(text) > limit:
+        text = text[:limit].rsplit("\n", 1)[0] + "\n… (truncated, read the file for the rest)"
+    return text
+
+
+def cmd_hook(event):
+    """
+    Entry point for Claude Code hooks. The payload arrives on stdin as JSON.
+
+    session-start  prints STATE.md, which Claude Code adds to the context —
+                   so a session that just lost its memory to /clear or a
+                   compaction still knows what it was doing.
+    stop-failure   records that this session stopped on a rate limit. Exact,
+                   unlike reading the screen.
+    pre-compact    notes that context is about to be squeezed, so the watcher
+                   asks for a fresh checkpoint afterwards.
+    """
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("cwd", os.getcwd())
+
+    if event == "session-start":
+        digest = state_digest(payload["cwd"])
+        if digest:
+            print("A Continuum plan is active in this project. Picking up from "
+                  "`.continuum/STATE.md`:\n\n"
+                  f"{digest}\n\n"
+                  "Continue from 'Next step'. Do not re-plan and do not redo "
+                  "anything under 'Done'. Update STATE.md as you go.")
+    elif event == "stop-failure":
+        record_event("rate_limit", payload)
+    elif event == "pre-compact":
+        record_event("pre_compact", payload)
+    else:
+        print(f"unknown hook event: {event}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def notify(title, message, enabled=True):
     if not enabled or sys.platform != "darwin":
         return
@@ -581,6 +723,7 @@ def daemon_pid():
 def scan_once(cfg, state, backends):
     now = time.time()
     enabled = load_enabled()
+    events = consume_events()
     seen = set()
 
     for backend in backends:
@@ -606,6 +749,25 @@ def scan_once(cfg, state, backends):
 
             busy = is_busy(cfg, pane.text)
             limit_msg = find_limit(cfg, pane.text)
+
+            # A StopFailure(rate_limit) hook is the vendor saying so outright;
+            # trust it even when the wording on screen matches nothing.
+            pane_events = events.get(cwd, {})
+            hook_limit = pane_events.get("rate_limit")
+            if hook_limit and not busy:
+                entry["hook_limit_at"] = hook_limit["at"]
+                if not limit_msg:
+                    # The banner may have scrolled off screen; the transcript keeps it
+                    limit_msg = limit_from_transcript(hook_limit.get("transcript"))
+                    source = "transcript" if limit_msg else "hook only, no reset time"
+                    if not limit_msg:
+                        limit_msg = "rate limit reported by Claude Code (StopFailure hook)"
+                    log.info("hook reported a rate limit for %s (%s) — %s",
+                             pane.label, cwd or "?", source)
+            if pane_events.get("pre_compact"):
+                # Context was squeezed: whatever STATE.md says is now stale
+                entry["last_checkpoint"] = 0
+                log.info("context compacted in %s, checkpoint due", pane.label)
 
             # --- verify a send that already went out ---
             if entry["status"] == "probing":
@@ -879,6 +1041,15 @@ def main():
     if cmd in ("-V", "--version"):
         print(VERSION)
         return 0
+
+    # Hooks run before logging is wired up on purpose: for SessionStart, stdout
+    # becomes part of Claude's context, and log lines have no business there.
+    if cmd == "hook":
+        if len(args) < 2:
+            print("usage: continuum hook <session-start|stop-failure|pre-compact>",
+                  file=sys.stderr)
+            return 1
+        return cmd_hook(args[1])
 
     setup_logging("-v" in args or "--verbose" in args)
     cfg = load_config()

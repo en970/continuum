@@ -15,9 +15,10 @@ sent yourself. Nothing is sent while a limit is in effect.
 
 ## What it does
 
-- Watches your terminal panes for the usage-limit message.
-- Reads the reset time out of that message (`resets 1:50am`, `try again in 2h
-  15m`, weekly limits, and so on).
+- Learns a session hit its limit from Claude Code's own `StopFailure` hook,
+  falling back to reading the terminal when hooks are unavailable.
+- Reads the reset time out of the session transcript (`resets 1:50am`, `try
+  again in 2h 15m`, weekly limits, and so on).
 - At that time, sends **one** resume message to that pane. If it does not take,
   one backup attempt five minutes later — then it stops and tells you.
 - Optionally keeps a plan and a progress file in the project, so a session that
@@ -78,6 +79,34 @@ When a limit is close (`Approaching usage limit`, or context dropping below
 15%), the watcher asks the session to save its progress first. That way a limit
 landing mid-task does not lose the thread. At most once every 30 minutes per
 session.
+
+## Hooks: knowing rather than guessing
+
+Reading the screen is a guess. This project learned that the hard way — the
+patterns were written for `usage limit reached`, Claude Code actually says
+`You've hit your session limit`, and the whole thing sat there silently doing
+nothing through a real limit.
+
+So the primary signals are Claude Code's own hooks, installed for you:
+
+| Hook | What it gives us |
+|---|---|
+| `StopFailure` (`rate_limit`) | The turn ended on a rate limit. Exact, with `cwd` and `transcript_path`. |
+| `SessionStart` (`startup\|resume\|clear\|compact`) | Prints `.continuum/STATE.md` into the new context. |
+| `PreCompact` | Context is about to be squeezed, so a fresh checkpoint is due. |
+
+The reset time then comes from the transcript, which stores the limit turn as a
+structured record — `error: "rate_limit"`, `apiErrorStatus: 429`, banner text in
+`message.content[].text`. No pattern matching, and it cannot scroll away.
+
+`SessionStart` is the one that changes the feel of it: open a session in a
+project with a `.continuum` plan and the plan is already in context. After a
+`/clear` or a compaction, the work picks up instead of starting over.
+
+Screen scraping still runs as a fallback for setups without hooks, and the
+patterns remain in config. Installing adds these three hooks to
+`~/.claude/settings.json`, leaving anything already there untouched and keeping
+a `.continuum-backup` copy; `./install.sh --uninstall` removes only its own.
 
 ## Configuration
 
@@ -163,7 +192,8 @@ app/                SwiftUI menu app, icon generator, build script
 ```
 
 State lives in `~/.local/state/continuum/` (or `$XDG_STATE_HOME`): `state.json`,
-your ticks in `enabled.json`, and `continuum.log`.
+your ticks in `enabled.json`, pending hook events in `events/`, and
+`continuum.log`.
 
 ## Licence
 
